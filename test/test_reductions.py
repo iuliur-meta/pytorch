@@ -2791,6 +2791,46 @@ class TestReductions(TestCase):
                     RuntimeError, r'quantile\(\) out tensor must be on the same device as the input tensor'):
                 torch.quantile(torch.randn(1, device=device), 0.5, out=torch.scalar_tensor(1))
 
+    @dtypes(torch.float, torch.double)
+    def test_quantile_compile_dynamic(self, device, dtype):
+        # Regression test for https://github.com/pytorch/pytorch/issues/179383
+        # quantile/nanquantile should work under torch.compile with dynamic=True
+        for op in [torch.quantile, torch.nanquantile]:
+            # scalar q
+            def fn_scalar(x):
+                return op(x, 0.5)
+
+            x = torch.tensor([1.0, 3.0, 2.0, 5.0, 4.0], device=device, dtype=dtype)
+            eager_out = fn_scalar(x)
+            compiled_fn = torch.compile(
+                fn_scalar, backend="aot_eager_decomp_partition", dynamic=True
+            )
+            compiled_out = compiled_fn(x)
+            self.assertEqual(eager_out, compiled_out)
+
+            # tensor q
+            def fn_tensor(x):
+                return op(x, torch.tensor([0.25, 0.5, 0.75], device=x.device, dtype=x.dtype))
+
+            eager_out2 = fn_tensor(x)
+            compiled_fn2 = torch.compile(
+                fn_tensor, backend="aot_eager_decomp_partition", dynamic=True
+            )
+            compiled_out2 = compiled_fn2(x)
+            self.assertEqual(eager_out2, compiled_out2)
+
+            # with dim
+            def fn_dim(x):
+                return op(x, 0.5, dim=0)
+
+            x2 = torch.randn(3, 4, device=device, dtype=dtype)
+            eager_out3 = fn_dim(x2)
+            compiled_fn3 = torch.compile(
+                fn_dim, backend="aot_eager_decomp_partition", dynamic=True
+            )
+            compiled_out3 = compiled_fn3(x2)
+            self.assertEqual(eager_out3, compiled_out3)
+
     def test_std_mean(self, device):
         x = torch.rand(100, 50, 20, device=device)
         for dim in range(x.dim()):

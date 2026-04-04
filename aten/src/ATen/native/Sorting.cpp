@@ -258,7 +258,11 @@ Tensor quantile_compute(
   // synchronizing an accelerator with the CPU
   // The check is also skipped when the actual q values are not available yet
   // e.g. with symbolic shapes or during export
-  if (self.device().is_cpu() && !isTensorSubclassLike(q)) {
+  // Also skip when self is a tensor subclass (e.g. FakeTensor) because
+  // at::scalar_tensor(q, self.options()) does not propagate the subclass
+  // dispatch key, so isTensorSubclassLike(q) alone is insufficient when
+  // the scalar q overload creates q internally.
+  if (self.device().is_cpu() && !isTensorSubclassLike(self) && !isTensorSubclassLike(q)) {
     auto all_q_in_range = q.ge(0).logical_and_(q.le(1)).all();
     TORCH_CHECK(at::is_scalar_tensor_true(all_q_in_range),
                 "quantile() q values must be in the range [0, 1]");
