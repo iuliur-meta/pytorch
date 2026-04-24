@@ -392,6 +392,16 @@ its type to `common_constant_types`.
             and self.as_python_constant() == other.as_python_constant()
         )
 
+    def get_id(self, tx: InstructionTranslator) -> int | None:
+        # Singletons have guaranteed stable identity across the process lifetime.
+        if self.value is None or self.value is True or self.value is False:
+            return id(self.value)
+        # Sourceful constants resolve via source like any other sourceful VT.
+        # Sourceless non-singleton constants (e.g. literal 42 in compiled code)
+        # get FakeIdVariable — CPython interning of small ints/strings is an
+        # implementation detail users shouldn't rely on.
+        return super().get_id(tx)
+
     def get_real_python_backed_value(self) -> object:
         return self.value
 
