@@ -1366,6 +1366,50 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
         fn(x).sum().backward()
         self.assertEqual(x.grad, x * 3)
 
+    @requires_cuda_and_triton
+    @torch._dynamo.config.patch(
+        trace_autograd_ops=True,
+        inline_single_use_invoke_subgraph=False,
+    )
+    def test_nested_region_config_propagated_to_backward(self):
+        """When joint tracing creates backward invoke_subgraph nodes,
+        the nested_region_config should be propagated so the regional
+        compiler can compile them (2 triton codes: fw + bw subgraphs).
+        """
+        nested_config = get_invoke_subgraph_compile_options()
+
+        @torch.compiler.nested_compile_region(options=nested_config)
+        def nested_fn(x):
+            return x.sin()
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4, bias=False, device="cuda")
+                self.head = torch.nn.Linear(4, 1, bias=False, device="cuda")
+
+            def forward(self, x):
+                y = self.linear(x)
+                z = nested_fn(y)
+                z_det = z.detach().requires_grad_()
+                loss = self.head(z_det).sum()
+                loss.backward()
+                z.backward(z_det.grad)
+                return loss.detach()
+
+        model = Model()
+        x = torch.randn(4, 4, device="cuda")
+        opt_model = torch.compile(
+            model,
+            backend=aot_eager_regional_inductor(
+                serialize=False, on_invoke_subgraph=True
+            ),
+            fullgraph=True,
+        )
+        _, codes = run_fw_bw_and_get_code(lambda: opt_model(x))
+        # 2 triton codes: one for fw invoke_subgraph, one for bw invoke_subgraph
+        self.assertEqual(len(codes), 2)
+
 
 @skipIfTorchDynamo("Not a suitable dynamo wrapped test")
 class TestRegionalOutputCode(torch._inductor.test_case.TestCase):
