@@ -1165,6 +1165,7 @@ class OptimizeContext(_TorchDynamoContext):
         error_on_graph_break: bool | None = None,
         export: bool = False,
         dynamic: bool | None = None,
+        dynamic_shapes: Any = None,
         compiler_config: Any | None = None,
         rebuild_ctx: Callable[[], OptimizeContext | _NullDecorator] | None = None,
         package: CompilePackage | None = None,
@@ -1187,6 +1188,29 @@ class OptimizeContext(_TorchDynamoContext):
             package=package,
             hooks=hooks,
         )
+
+        if dynamic_shapes is not None:
+            # Set the ``_active_dynamic_shapes`` ContextVar for the
+            # duration of each compiled-fn invocation, so the dynamo
+            # builder reads the spec during tracing. Normalizes both a
+            # plain dict and a ``ModelSpec`` to a flat dict.
+            from torch._dynamo.dynamic_spec import _active_dynamic_shapes, ModelSpec
+
+            if isinstance(dynamic_shapes, ModelSpec):
+                normalized_shapes: dict[str, Any] = dict(dynamic_shapes.items())
+            elif isinstance(dynamic_shapes, dict):
+                normalized_shapes = dict(dynamic_shapes)
+            else:
+                raise TypeError(
+                    f"dynamic_shapes must be a dict or ModelSpec, got "
+                    f"{type(dynamic_shapes).__name__}"
+                )
+
+            def activate_dynamic_shapes() -> Callable[[], None]:
+                token = _active_dynamic_shapes.set(normalized_shapes)
+                return lambda: _active_dynamic_shapes.reset(token)
+
+            self.enter_exit_hooks.append(activate_dynamic_shapes)
 
         if config.compiled_autograd:
             _dynamic = self._dynamic
@@ -1334,6 +1358,7 @@ def _optimize_catch_errors(
     error_on_graph_break: bool | None = None,
     export: bool = False,
     dynamic: bool | None = None,
+    dynamic_shapes: Any = None,
     compiler_config: Any | None = None,
     rebuild_ctx: Callable[[], OptimizeContext | _NullDecorator] | None = None,
     package: CompilePackage | None = None,
@@ -1346,6 +1371,7 @@ def _optimize_catch_errors(
         error_on_graph_break=error_on_graph_break,
         export=export,
         dynamic=dynamic,
+        dynamic_shapes=dynamic_shapes,
         compiler_config=compiler_config,
         rebuild_ctx=rebuild_ctx,
         package=package,
@@ -1534,6 +1560,7 @@ def _optimize(
     | None = None,
     disable: bool = False,
     dynamic: bool | None = None,
+    dynamic_shapes: Any = None,
     package: CompilePackage | None = None,
     recompile_limit: int | None = None,
 ) -> OptimizeContext | _NullDecorator:
@@ -1591,6 +1618,7 @@ def _optimize(
         return optimize_assert(
             backend,
             dynamic=dynamic,
+            dynamic_shapes=dynamic_shapes,
             hooks=hooks,
             rebuild_ctx=rebuild_ctx,
             package=package,
@@ -1626,6 +1654,7 @@ def _optimize(
         error_on_graph_break=error_on_graph_break
         and not config.debug_force_graph_break_on_leaf_return,
         dynamic=dynamic,
+        dynamic_shapes=dynamic_shapes,
         compiler_config=(
             backend.get_compiler_config()
             if hasattr(backend, "get_compiler_config")
@@ -2470,6 +2499,7 @@ def _optimize_assert(
     export: bool = False,
     export_constraints: Any | None = None,
     dynamic: bool | None = None,
+    dynamic_shapes: Any = None,
     package: CompilePackage | None = None,
     recompile_limit: int | None = None,
 ) -> OptimizeContext:
@@ -2509,6 +2539,7 @@ def _optimize_assert(
         fullgraph=True,
         export=export,
         dynamic=dynamic,
+        dynamic_shapes=dynamic_shapes,
         rebuild_ctx=rebuild_ctx,
         package=package,
     )
