@@ -5,8 +5,24 @@ from collections.abc import Callable, Sequence
 
 import torch
 from torch.distributed._functional_collectives import AsyncCollectiveTensor
+from torch.distributed.spmd_types import (
+    assert_type as spmd_assert_type,
+    I,
+    is_available,
+    MeshAxis,
+    P,
+    R,
+    S,
+    set_current_mesh,
+    typecheck,
+)
 from torch.distributed.tensor import DeviceMesh, DTensor
-from torch.distributed.tensor.placement_types import Placement
+from torch.distributed.tensor.placement_types import (
+    _Partial,
+    Placement,
+    Replicate as _Replicate,
+    Shard as _Shard,
+)
 
 
 try:
@@ -22,6 +38,52 @@ InputPlacements = tuple[PlacementType, ...] | None
 OutputPlacements = PlacementType | tuple[PlacementType, ...]
 
 
+def _placement_to_spmd_type(
+    placement: Placement, grad_placement: Placement | None = None
+):
+    """Convert a DTensor Placement to an spmd_types local type.
+
+    - Shard(dim) -> S(dim)
+    - Replicate -> R (default; I only if grad is explicitly Replicate)
+    - Partial -> P
+    """
+    if isinstance(placement, _Shard):
+        return S(placement.dim)
+    elif isinstance(placement, _Replicate):
+        if isinstance(grad_placement, _Replicate):
+            return I
+        return R
+    elif isinstance(placement, _Partial):
+        return P
+    else:
+        raise ValueError(f"Unsupported placement type: {placement}")
+
+
+def _annotate_spmd_types(
+    flat_local_args: list,
+    in_placements: InputPlacements,
+    in_grad_placements: InputPlacements,
+    device_mesh: DeviceMesh,
+) -> None:
+    """Annotate unwrapped local tensors with spmd_types inferred from placements."""
+    for idx, local_arg in enumerate(flat_local_args):
+        if not isinstance(local_arg, torch.Tensor) or isinstance(local_arg, DTensor):
+            continue
+        if in_placements is None or in_placements[idx] is None:
+            continue
+        placements = in_placements[idx]
+        grad_placements = (
+            in_grad_placements[idx] if in_grad_placements is not None else None
+        )
+        spmd_type = {}
+        for dim_idx, placement in enumerate(placements):  # pyrefly: ignore
+            mesh_dim_name = device_mesh.mesh_dim_names[dim_idx]  # pyrefly: ignore
+            axis = MeshAxis.of(device_mesh.get_group(mesh_dim_name))
+            grad_p = grad_placements[dim_idx] if grad_placements is not None else None
+            spmd_type[axis] = _placement_to_spmd_type(placement, grad_p)
+        spmd_assert_type(local_arg, spmd_type)
+
+
 def local_map(
     func: Callable | None = None,
     out_placements: OutputPlacements = None,
@@ -30,6 +92,7 @@ def local_map(
     device_mesh: DeviceMesh | None = None,
     *,
     redistribute_inputs: bool = False,
+    spmd_types: bool = False,
 ):
     """
     :meth:`local_map` is an experimental API that allows users to pass :class:`DTensor` s
@@ -142,6 +205,7 @@ def local_map(
                 in_grad_placements=in_grad_placements,
                 device_mesh=device_mesh,
                 redistribute_inputs=redistribute_inputs,
+                spmd_types=spmd_types,
             )
 
         return decorated
@@ -154,6 +218,7 @@ def local_map(
         in_grad_placements,
         device_mesh,
         redistribute_inputs,
+        spmd_types,
     )
 
 
@@ -164,6 +229,7 @@ def _local_map_wrapped(
     in_grad_placements: InputPlacements,
     device_mesh: DeviceMesh | None,
     redistribute_inputs: bool,
+    enable_spmd_types: bool,
     *args,
     **kwargs,
 ):
@@ -244,7 +310,23 @@ def _local_map_wrapped(
     # pyrefly: ignore [bad-argument-type]
     local_args = pytree.tree_unflatten(flat_local_args, args_spec)
 
-    out = func(*local_args, **kwargs)
+    if enable_spmd_types and seen_dtensor_arg:
+        if not is_available():
+            raise RuntimeError(
+                "spmd_types=True requires the spmd_types package to be installed"
+            )
+        assert device_mesh is not None  # noqa: S101
+        _annotate_spmd_types(
+            flat_local_args, in_placements, in_grad_placements, device_mesh
+        )
+        mesh_axes = frozenset(
+            MeshAxis.of(device_mesh.get_group(name))
+            for name in device_mesh.mesh_dim_names  # pyrefly: ignore
+        )
+        with set_current_mesh(mesh_axes), typecheck(strict_mode="strict"):
+            out = func(*local_args, **kwargs)
+    else:
+        out = func(*local_args, **kwargs)
 
     if seen_dtensor_arg:
         # process output to be DTensor if we've seen DTensor inputs
