@@ -2793,7 +2793,7 @@ def compile(
     else:
         backend = _TorchCompileWrapper(backend, mode, options, dynamic)
 
-    return torch._dynamo.optimize(
+    compiled = torch._dynamo.optimize(
         backend=backend,
         nopython=fullgraph,
         dynamic=dynamic,
@@ -2801,6 +2801,8 @@ def compile(
         guard_filter_fn=guard_filter_fn,
         recompile_limit=recompile_limit,
     )(model)  # type: ignore[return-value]
+
+    return compiled
 
 
 def _register_device_module(device_type, module):
