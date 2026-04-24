@@ -1530,6 +1530,114 @@ class TestMPS(TestCaseMPS):
 
         self.assertEqual(out_cpu, out_mps)
 
+    @parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    @parametrize("input_shape", [(4, 8), (2, 5, 8), (1, 3, 4, 8), (2, 1, 3, 2, 8)])
+    @parametrize("input_layout", ["contig", "sliced", "permuted", "expanded"])
+    @parametrize("weight_layout", ["contig", "sliced", "permuted", "expanded"])
+    @parametrize("bias_mode", ["none", "contig", "broadcast_expand"])
+    def test_linear_comprehensive(self, dtype, input_shape, input_layout, weight_layout, bias_mode):
+        # Comprehensive test for F.linear with various strided/permuted/broadcasted
+        # tensors. Covers issues around MPSGraph handling of stride-0 inputs, e.g.
+        # https://github.com/pytorch/pytorch/issues/180776 (non-deterministic
+        # F.linear for >2D bf16/fp16 inputs) and the related stride-0 mm fix
+        # https://github.com/pytorch/pytorch/issues/180201.
+        in_f, out_f = 8, 6
+
+        def make_input(shape):
+            # shape[-1] must be in_f; build it with the requested layout.
+            if input_layout == "contig":
+                return torch.randn(shape, dtype=dtype)
+            if input_layout == "sliced":
+                # Allocate 2x along an interior dim and slice with stride 2.
+                big = list(shape)
+                sdim = max(0, len(big) - 2)
+                big[sdim] *= 2
+                t = torch.randn(big, dtype=dtype)
+                slicer = [slice(None)] * len(big)
+                slicer[sdim] = slice(None, None, 2)
+                return t[tuple(slicer)]
+            if input_layout == "permuted":
+                # Build contiguous in a permuted order, then permute back so the
+                # last dim (in_f) is the inner dim but the memory layout differs.
+                perm = list(range(len(shape)))
+                if len(perm) >= 2:
+                    perm[0], perm[-1] = perm[-1], perm[0]
+                orig_shape = [shape[i] for i in perm]
+                t = torch.randn(orig_shape, dtype=dtype)
+                inv_perm = [perm.index(i) for i in range(len(perm))]
+                return t.permute(inv_perm)
+            if input_layout == "expanded":
+                # Create a stride-0 dim by expanding a leading size-1 dim.
+                if len(shape) < 2:
+                    return torch.randn(shape, dtype=dtype)
+                base_shape = (1,) + tuple(shape[1:])
+                return torch.randn(base_shape, dtype=dtype).expand(shape)
+            raise AssertionError(input_layout)
+
+        def make_weight():
+            shape = (out_f, in_f)
+            if weight_layout == "contig":
+                return torch.randn(shape, dtype=dtype)
+            if weight_layout == "sliced":
+                big = torch.randn(out_f * 2, in_f, dtype=dtype)
+                return big[::2]
+            if weight_layout == "permuted":
+                # Allocate (in_f, out_f) contiguous, then transpose.
+                return torch.randn(in_f, out_f, dtype=dtype).t()
+            if weight_layout == "expanded":
+                # Stride-0 weight: broadcast a single row across out_f.
+                return torch.randn(1, in_f, dtype=dtype).expand(out_f, in_f)
+            raise AssertionError(weight_layout)
+
+        def make_bias():
+            if bias_mode == "none":
+                return None
+            if bias_mode == "contig":
+                return torch.randn(out_f, dtype=dtype)
+            if bias_mode == "broadcast_expand":
+                # Stride-0 bias (allowed via expand, then F.linear broadcasts).
+                return torch.randn(1, dtype=dtype).expand(out_f)
+            raise AssertionError(bias_mode)
+
+        torch.manual_seed(0)
+        x_cpu = make_input(input_shape)
+        w_cpu = make_weight()
+        b_cpu = make_bias()
+
+        x_mps = x_cpu.detach().to("mps")
+        w_mps = w_cpu.detach().to("mps")
+        b_mps = b_cpu.detach().to("mps") if b_cpu is not None else None
+
+        out_cpu = F.linear(x_cpu.float(), w_cpu.float(),
+                           b_cpu.float() if b_cpu is not None else None).to(dtype)
+
+        # Consistency: two consecutive calls on MPS must match exactly
+        # (regression guard for #180776).
+        out_mps_1 = F.linear(x_mps, w_mps, b_mps).clone()
+        out_mps_2 = F.linear(x_mps, w_mps, b_mps).clone()
+        self.assertEqual(out_mps_1, out_mps_2, atol=0, rtol=0,
+                         msg=f"Non-deterministic F.linear on MPS for "
+                             f"dtype={dtype}, shape={input_shape}, "
+                             f"input={input_layout}, weight={weight_layout}, bias={bias_mode}")
+
+        # Accuracy vs CPU (reference computed in float32 to avoid bf16/fp16 CPU noise).
+        tol = {torch.float32: 1e-4, torch.float16: 5e-2, torch.bfloat16: 1e-1}[dtype]
+        self.assertEqual(out_cpu, out_mps_1.cpu(), atol=tol, rtol=tol)
+
+    @parametrize("dtype", [torch.float16, torch.bfloat16])
+    @parametrize("shape", [(2, 13, 1024), (6, 6, 634), (1, 3, 28, 315),
+                           (1, 12, 4, 512), (1, 1, 5, 6, 1024)])
+    def test_linear_nd_determinism(self, dtype, shape):
+        # Regression test for https://github.com/pytorch/pytorch/issues/180776
+        # F.linear on MPS with >2D fp16/bf16 inputs and no bias produced
+        # different results across consecutive calls.
+        h = shape[-1]
+        x = torch.randn(shape, dtype=dtype, device="mps")
+        w = torch.randn(h, h, dtype=dtype, device="mps")
+        first = F.linear(x, w).clone()
+        second = F.linear(x, w).clone()
+        self.assertEqual(first, second, atol=0, rtol=0)
+
     def test_uniform(self):
         low = torch.zeros(5, 5, requires_grad=True)
         high = (torch.ones(5, 5) * 3).requires_grad_()
