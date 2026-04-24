@@ -1410,6 +1410,28 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
         # 2 triton codes: one for fw invoke_subgraph, one for bw invoke_subgraph
         self.assertEqual(len(codes), 2)
 
+    @torch._dynamo.config.patch(trace_autograd_ops=True)
+    def test_autograd_grad_with_nested_compile_region(self):
+        nested_config = get_invoke_subgraph_compile_options()
+
+        @torch.compiler.nested_compile_region(options=nested_config)
+        def g(x, w):
+            return torch.matmul(x, w)
+
+        def fn(x, w):
+            out = g(x, w)
+            loss = out.sum()
+            (grad_w,) = torch.autograd.grad(loss, w)
+            return loss.detach(), grad_w
+
+        x = torch.randn(4, 4)
+        w = torch.randn(4, 4, requires_grad=True)
+
+        ref = fn(x, w)
+        opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
+        res = opt_fn(x, w)
+        self.assertEqual(ref, res)
+
 
 @skipIfTorchDynamo("Not a suitable dynamo wrapped test")
 class TestRegionalOutputCode(torch._inductor.test_case.TestCase):
