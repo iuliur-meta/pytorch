@@ -112,6 +112,11 @@ def typecheck(strict_mode: Any = None, local: Any = None):
 
 
 @contextmanager
+def no_typecheck():
+    yield
+
+
+@contextmanager
 def set_current_mesh(axes: Any = None):
     yield
 
@@ -130,6 +135,7 @@ __all__ = [
     "get_local_type",
     "set_local_type",
     "typecheck",
+    "no_typecheck",
     "set_current_mesh",
     "get_partition_spec",
     "normalize_axis",

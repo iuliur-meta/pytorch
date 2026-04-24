@@ -27,7 +27,11 @@ if _HAS_SPMD_TYPES:
     globals().update({name: getattr(_mod, name) for name in _public})
     __all__ = _public + ["is_available"]  # noqa: PLE0605
 
-    from spmd_types._checker import get_partition_spec, typecheck  # pyrefly: ignore
+    from spmd_types._checker import (  # pyrefly: ignore
+        get_partition_spec,
+        no_typecheck,
+        typecheck,
+    )
     from spmd_types._mesh import set_current_mesh  # pyrefly: ignore
     from spmd_types._mesh_axis import _reset, MeshAxis  # pyrefly: ignore
     from spmd_types._type_attr import get_local_type, set_local_type  # pyrefly: ignore
@@ -51,6 +55,7 @@ else:
         get_partition_spec,
         has_local_type,
         MeshAxis,
+        no_typecheck,
         normalize_axis,
         set_current_mesh,
         set_local_type,
